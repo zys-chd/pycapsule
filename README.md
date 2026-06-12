@@ -1,11 +1,13 @@
 # pybox
 
-> Pack Python apps into ~700 KB self-contained binaries.  
+> Pack Python projects into tiny self-contained binaries — 100× smaller than PyInstaller.  
 > Zero console windows. Auto-installs missing dependencies.
 
 ```
-PyInstaller:  74 MB  ──→  pybox:  700 KB   (100× smaller)
+PyInstaller:  74 MB  ──→  pybox:  < 1 MB   (100× smaller)
 ```
+
+English | [中文](README_zh.md)
 
 ---
 
