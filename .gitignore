@@ -1,0 +1,21 @@
+# Build artifacts
+src/resource.h
+*.o
+*.obj
+*.exe
+*.ilk
+*.pdb
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
