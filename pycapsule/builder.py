@@ -89,9 +89,11 @@ def compile_launcher(console=False):
             suffix = "console" if console else "gui"
             out = LAUNCHERS_DIR / f"launcher_win_x64_{suffix}.exe"
             flags = [cc, "-O2", "-s", "-std=c11", "-o", str(out), str(src),
-                     "-lz", f"-I{SRC_DIR}",
+                     "/usr/x86_64-w64-mingw32/lib/libz.a",
+                     f"-I{SRC_DIR}",
                      f"-I/usr/x86_64-w64-mingw32/include",
-                     f"-L/usr/x86_64-w64-mingw32/lib"]
+                     f"-L/usr/x86_64-w64-mingw32/lib",
+                     "-static-libgcc"]
             if not console:
                 flags.append("-mwindows")
             else:
