@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #ifdef _WIN32
   #include <windows.h>
@@ -759,12 +760,72 @@ static int check_tkinter(const char *python) {
     return check_package(python, "tkinter");
 }
 
+#ifdef _WIN32
+/* ── Debug logging ───────────────────────────────────── */
+static FILE *_dbg = NULL;
+
+static void debug_log(const char *fmt, ...) {
+    if (!_dbg) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(_dbg, fmt, ap);
+    va_end(ap);
+    fflush(_dbg);
+}
+
+static void debug_init(void) {
+    char path[MAX_PATH_LEN];
+    const char *td = getenv("TEMP");
+    if (!td) td = getenv("TMP");
+    if (!td) td = "C:\\Windows\\Temp";
+    snprintf(path, sizeof(path), "%s\\pycapsule_debug.log", td);
+    _dbg = fopen(path, "w");
+    if (_dbg) {
+        debug_log("=== Pycapsule Debug Log ===\n");
+    }
+}
+
+static void debug_close(void) {
+    if (_dbg) { fclose(_dbg); _dbg = NULL; }
+}
+
+/* Wrapper for check_package with debug */
+static int check_package_dbg(const char *python, const char *import_name) {
+    debug_log("check: python=%s  import=%s\n", python, import_name);
+    int ret = check_package(python, import_name);
+    debug_log("  result=%d (%s)\n", ret,
+        ret == 0 ? "OK" : ret == -1 ? "PYTHON_UNREACHABLE" : "MISSING");
+    return ret;
+}
+
+/* Wrapper for pip_install_one with debug */
+static int pip_install_one_dbg(const char *python, const char *pkg, int cur, int total) {
+    debug_log("pip_install: %s (%d/%d)\n", pkg, cur, total);
+    int ret = pip_install_one(python, pkg, cur, total);
+    debug_log("  result=%d\n", ret);
+    return ret;
+}
+
+#define CHECK_PKG(py, imp)     check_package_dbg(py, imp)
+#define PIP_INSTALL(py, p, c, t) pip_install_one_dbg(py, p, c, t)
+#else
+#define CHECK_PKG(py, imp)     check_package(py, imp)
+#define PIP_INSTALL(py, p, c, t) pip_install_one(py, p, c, t)
+#endif
+
 /* ═══════════════════════════════════════════════════════
  * 主流程
  * ═══════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
+    int debug_mode = 0;
 #ifdef _WIN32
+    /* ── Debug mode ── */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) { debug_mode = 1; break; }
+    }
+    if (debug_mode) debug_init();
+
     /* ── 隐藏模式: --cleanup <tempdir> <pid> ── */
     if (argc >= 4 && strcmp(argv[1], "--cleanup") == 0) {
         DWORD pid = (DWORD)atoi(argv[3]);
@@ -787,12 +848,15 @@ int main(int argc, char **argv) {
     /* ── 0. 查找 Python（不检查版本） ── */
     char python[MAX_PATH_LEN] = {0};
     if (find_python(python, sizeof(python)) != 0) {
+        debug_log("FATAL: Python not found\n");
+        if (debug_mode) debug_close();
         msgbox_error("Pycapsule",
             "未找到 Python。\n\n"
             "请安装 Python 3.10 或更高版本：\n"
             "https://www.python.org/downloads/");
         return 1;
     }
+    debug_log("Python found: %s\n", python);
 
     /* ── 2. 解压资源 ── */
     if (create_temp_dir(g_temp_dir, sizeof(g_temp_dir)) != 0) {
@@ -817,11 +881,15 @@ int main(int argc, char **argv) {
 
     /* ── 3. 加载运行时配置 ── */
     if (load_config(g_temp_dir) != 0) {
+        debug_log("FATAL: config load failed\n");
+        if (debug_mode) debug_close();
         msgbox_error("Pycapsule",
             "无法读取应用配置 (_pycapsule_/config.txt)。\n"
             "请确认打包正确。");
         return 1;
     }
+    debug_log("Config: app=%s py_min=%d.%d zip=%s entry=%s reqs=%d\n",
+        g_app_name, g_py_min_major, g_py_min_minor, g_zip_prefix, g_entry, g_req_count);
 
     /* ── 4. 验证 Python 版本 ── */
     {
@@ -872,6 +940,7 @@ int main(int argc, char **argv) {
         snprintf(stamp_path, sizeof(stamp_path), "%s/_pc_%s_ok", td, safe_name);
     }
     int is_first_run = (access(stamp_path, F_OK) != 0);
+    debug_log("Stamp: %s first_run=%d\n", stamp_path, is_first_run);
 
     /* ── 6. 环境检查（仅首次运行） ── */
     if (is_first_run) {
@@ -907,7 +976,7 @@ int main(int argc, char **argv) {
                   "正在检查 %s (%d/%d)...", g_req_import[i], i+1, g_req_count);
               show_status(prog); pump_messages(); }
 #endif
-            int cr = check_package(python, g_req_import[i]);
+            int cr = CHECK_PKG(python, g_req_import[i]);
             if (cr == -1) {
                 /* Python not reachable — fatal */
 #ifdef _WIN32
@@ -941,7 +1010,7 @@ int main(int argc, char **argv) {
 
             for (int m = 0; m < missing_count; m++) {
                 int idx = missing_idx[m];
-                int pr = pip_install_one(python, g_req_pip[idx], m + 1, missing_count);
+                int pr = PIP_INSTALL(python, g_req_pip[idx], m + 1, missing_count);
                 if (pr == -1) {
 #ifdef _WIN32
                     hide_status();
@@ -962,7 +1031,7 @@ int main(int argc, char **argv) {
             char still_names[1024] = {0};
             int sn_pos = 0;
             for (int i = 0; i < g_req_count; i++) {
-                if (check_package(python, g_req_import[i]) != 0) {
+                if (CHECK_PKG(python, g_req_import[i]) != 0) {
                     still_missing++;
                     int n = snprintf(still_names + sn_pos,
                         sizeof(still_names) - sn_pos,
