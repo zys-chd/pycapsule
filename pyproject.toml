@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "pycapsule"
+version = "2.0.0"
+description = "Tiny Python application packager — 50KB C launcher, no interpreter bundling"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "zhangxiaosong", email = "1725472881@qq.com"},
+]
+keywords = ["packaging", "exe", "launcher", "pyinstaller", "bundle"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Code Generators",
+]
+
+[project.scripts]
+pycapsule = "pycapsule.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zys-chd/pycapsule"
+Repository = "https://github.com/zys-chd/pycapsule.git"
+
+[tool.setuptools.packages.find]
+include = ["pycapsule", "pycapsule.*"]
+
+[tool.setuptools.package-data]
+pycapsule = ["launchers/*.exe", "launchers/*", "templates/*.json"]
