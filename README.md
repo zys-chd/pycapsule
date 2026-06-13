@@ -1,131 +1,140 @@
-# pycapsule
+# Pycapsule
 
-> Pack Python projects into tiny self-contained binaries — 100× smaller than PyInstaller.  
-> Zero console windows. Auto-installs missing dependencies.
+Tiny Python application packager — **50KB** C launcher, no interpreter bundling.
 
-```
-PyInstaller:  74 MB  ──→  pycapsule:  < 1 MB   (100× smaller)
-```
+| | PyInstaller | Pycapsule |
+|---|---|---|
+| Output size | ~30-70 MB | **~80 KB** |
+| Interpreter | Bundled | System Python |
+| Dependencies | Bundled | Auto pip install on first run |
+| Config | .spec Python script | .spec JSON |
+| Import detection | Recursive hooks | AST scanner |
 
-English | [中文](README_zh.md)
-
----
-
-## How It Works
-
-A tiny C launcher embeds your entire Python project as a compressed ZIP.  
-When double-clicked, it silently checks the system Python, verifies every  
-dependency, installs anything missing via `pip`, then launches your app —  
-all without a terminal window.
-
-```
-your_app.exe  (double-click)
-  │
-  ├─ Check Python version   (C layer, no scripts)
-  ├─ Check tkinter / GUI     (native error dialog if missing)
-  ├─ Check every pip package (one by one, in C)
-  ├─ Missing? → native dialog → pip install
-  ├─ Extract project to temp → launch your Python app
-  └─ Exit → auto-cleanup temp directory
-```
-
-**Native dialogs on every platform** — no console output, no terminal window.  
-macOS uses `osascript`, Windows uses `MessageBox`, Linux uses `zenity`.
-
----
+> Pycapsule packages only YOUR code. The target machine must have Python installed.
+> Ideal for internal tools, developer utilities, and any scenario where Python is already present.
 
 ## Quick Start
 
-### 1. Add pycapsule to your project
+```bash
+pip install pycapsule
+
+cd my_project
+python -m pycapsule              # auto-detect + package → dist/my_project.exe
+```
+
+## Usage
 
 ```bash
-cd your-project
-git clone https://github.com/yourname/pycapsule.git
+# Package current directory (auto-generates .spec)
+python -m pycapsule
+
+# Generate .spec file for customization
+python -m pycapsule --gen-spec
+
+# Package with custom spec
+python -m pycapsule myapp.spec
+
+# Show console window (default: hidden)
+python -m pycapsule --console
+
+# Only analyze imports (dry run)
+python -m pycapsule --analyze-only
+
+# Cross-compile for Windows from WSL/Linux
+python -m pycapsule --target windows
 ```
 
-### 2. Edit config
+## .spec File (JSON)
 
-`pycapsule/src/config.h` — change 5 things:
-
-```c
-#define PROJECT_NAME        "My Tool"       // dialog title
-#define PROJECT_NAME_EN     "My Tool"       // output binary name
-#define ZIP_PREFIX          "my_package"    // Python package directory
-#define REQUIREMENTS_COUNT  3
-// pip dependencies (import_name, pip_name, version):
-{ "numpy",      "numpy",      ">=2.0" },
-{ "pandas",     "pandas",     ">=2.0" },
-{ "matplotlib", "matplotlib", ">=3.8" },
+```json
+{
+  "app_name": "MyApp",
+  "entry": "main.py",
+  "console": false,
+  "python_min": "3.10",
+  "requirements": {
+    "numpy": ">=2.0",
+    "pandas": ">=2.0"
+  },
+  "hidden_imports": ["scipy.special"],
+  "exclude_dirs": ["__pycache__", ".git", ".venv"],
+  "stdout_file": null,
+  "stderr_file": null
+}
 ```
 
-### 3. Create bootstrap.py
+## How It Works
 
-In your project root, copy and edit `pycapsule/example/bootstrap.py`:
+```
+┌─ Build time ─────────────────────┐
+│  analyzer.py  →  scan imports    │
+│  packer.py    →  create ZIP      │
+│      injects _pycapsule_/        │
+│      ├── config.txt              │
+│      └── bootstrap.py            │
+│  builder.py   →  stitch binary   │
+│  ┌──────────────────────────┐    │
+│  │ launcher.exe  (pre-built)│    │
+│  │ [ZIP data]               │    │
+│  │ "PCZP" + size (8 bytes)  │    │
+│  └──────────────────────────┘    │
+└──────────────────────────────────┘
 
-```python
-import os, sys
-script_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(script_dir))
-
-from my_package.main import run
-run()
+┌─ Run time ───────────────────────┐
+│  1. Find Python (py -3 → PATH)   │
+│  2. Read ZIP from self (PCZP)    │
+│  3. Extract to %TEMP%            │
+│  4. Read _pycapsule_/config.txt  │
+│  5. First run: pip install deps  │
+│  6. pythonw.exe bootstrap.py     │
+│  7. Self-cleanup on exit         │
+└──────────────────────────────────┘
 ```
 
-### 4. Build
+## Dev: Building Launchers
+
+Pre-compiled launchers ship with the pip package. To rebuild from source:
 
 ```bash
-python pycapsule/pack.py
-# → pycapsule/my_tool (macOS/Linux) or pycapsule/my_tool.exe (Windows)
+# Windows GUI launcher (-mwindows)
+x86_64-w64-mingw32-gcc -O2 -s -std=c11 \
+  -I src -I /usr/x86_64-w64-mingw32/include \
+  src/launcher.c -L /usr/x86_64-w64-mingw32/lib -lz \
+  -mwindows -o pycapsule/launchers/launcher_win_x64_gui.exe
+
+# Windows Console launcher
+x86_64-w64-mingw32-gcc -O2 -s -std=c11 \
+  -I src -I /usr/x86_64-w64-mingw32/include \
+  src/launcher.c -L /usr/x86_64-w64-mingw32/lib -lz \
+  -lgdi32 -luser32 -lcomctl32 \
+  -o pycapsule/launchers/launcher_win_x64_console.exe
 ```
 
----
+Or use the built-in builder:
 
-## Build Requirements
-
-| Platform | One-liner | Notes |
-|----------|----------|-------|
-| macOS | `xcode-select --install` | clang + zlib built-in |
-| Linux | `sudo apt install build-essential zlib1g-dev` | gcc + zlib |
-| Windows (MinGW) | [winlibs.com](https://winlibs.com/) → extract → add to PATH | then `pacman -S mingw-w64-x86_64-zlib` |
-| Windows (MSVC) | Visual Studio Build Tools | manual: `cl /O2 /DRESOURCE_H ...` |
-
-**Don't want zlib?** Drop [miniz.h](https://github.com/richgel999/miniz) into `pycapsule/src/`,  
-change `#include <zlib.h>` → `#include "miniz.h"` in `launcher.c`, and compile without `-lz`.
-
----
-
-## Custom Excludes
-
-Create `pycapsule-exclude.txt` in your project root:
-
+```bash
+python -m pycapsule --build-launchers
 ```
-# directories (trailing /)
-data/
-models/checkpoints/
-
-# files
-.env
-large_dataset.csv
-```
-
----
 
 ## Project Structure
 
 ```
-your-project/
-├── pycapsule/                 ← git clone of pycapsule
-│   ├── pack.py            ← build script
-│   └── src/
-│       ├── config.h       ← ✏️ your config
-│       └── launcher.c     ← C source (don't touch)
-├── bootstrap.py           ← ✏️ your entry point
-├── pycapsule-exclude.txt      ← (optional)
-└── your_package/          ← your Python code
-```
+pycapsule/                ← pip package
+├── analyzer.py           AST import scanner
+├── spec.py               .spec JSON handling
+├── packer.py             ZIP creation + config injection
+├── builder.py            Binary stitching
+├── cli.py                CLI entry
+├── launchers/            Pre-compiled binaries
+├── bootstrap.py          Universal Python entry
+└── templates/            .spec templates
 
----
+src/                      ← C source
+├── launcher.c            C launcher (runtime config, dep mgmt)
+├── config.h              Template reference
+└── cleanup.c             Manual cleanup tool
+```
 
 ## License
 
-MIT
+MIT — see LICENSE file.

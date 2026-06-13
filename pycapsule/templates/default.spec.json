@@ -1,0 +1,16 @@
+{
+  "app_name": "",
+  "app_version": "1.0.0",
+  "entry": "main.py",
+  "icon": null,
+  "console": false,
+  "python_min": "3.10",
+  "python_url": "https://www.python.org/downloads/",
+  "stdout_file": null,
+  "stderr_file": null,
+  "exclude_dirs": ["__pycache__", ".git", ".venv", ".env", "build", "dist"],
+  "exclude_files": ["*.pyc", "*.spec", "*.pyo"],
+  "hidden_imports": [],
+  "requirements": {},
+  "data_dirs": []
+}

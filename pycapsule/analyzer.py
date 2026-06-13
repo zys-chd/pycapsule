@@ -57,12 +57,34 @@ _STDLIB = _stdlib_names()
 
 def scan_imports(root_dir):
     """Scan all .py files in root_dir, return sorted list of non-stdlib
-    top-level package names found via explicit import statements."""
+    top-level package names found via explicit import statements.
+
+    Filters out:
+    - Stdlib modules
+    - Local project modules (directories/files in root_dir)
+    """
     root = Path(root_dir).resolve()
     imports = set()
 
+    # Build set of local module names (all .py file stems in project)
+    local_names = set()
     for py_file in root.rglob("*.py"):
-        # Skip hidden dirs, __pycache__, venvs
+        parts = py_file.relative_to(root).parts
+        # Skip hidden/internal dirs
+        if any(p.startswith(".") or p.startswith("_") for p in parts[:-1]):
+            continue
+        if any(p in ("__pycache__", "build", "dist", ".venv", "venv") for p in parts):
+            continue
+        # Add file stem AND package names (subdirectory names)
+        local_names.add(py_file.stem)
+        # Add all parent directory names as potential package names
+        for p in parts[:-1]:
+            if not p.startswith("_") and not p.startswith("."):
+                local_names.add(p)
+    # Root name itself
+    local_names.add(root.name)
+
+    for py_file in root.rglob("*.py"):
         parts = py_file.relative_to(root).parts
         if any(p.startswith(".") or p in ("__pycache__",) for p in parts):
             continue
@@ -84,13 +106,13 @@ def scan_imports(root_dir):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split(".")[0]
-                    if top not in _STDLIB:
+                    if top not in _STDLIB and top not in local_names:
                         imports.add(top)
 
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     top = node.module.split(".")[0]
-                    if top not in _STDLIB:
+                    if top not in _STDLIB and top not in local_names:
                         imports.add(top)
 
     return sorted(imports)

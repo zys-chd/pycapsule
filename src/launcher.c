@@ -770,21 +770,7 @@ int main(int argc, char **argv) {
 #endif
     atexit(do_cleanup);
 
-    /* ── 0. 检查首次运行标记 ── */
-    char stamp_path[MAX_PATH_LEN];
-    {
-        const char *td = getenv("TEMP");
-        if (!td) td = getenv("TMP");
-#ifdef _WIN32
-        if (!td) td = "C:\\Windows\\Temp";
-#else
-        if (!td) td = "/tmp";
-#endif
-        snprintf(stamp_path, sizeof(stamp_path), "%s/_pc_env_ok", td);
-    }
-    int is_first_run = (access(stamp_path, F_OK) != 0);
-
-    /* ── 1. 查找 Python（不检查版本） ── */
+    /* ── 0. 查找 Python（不检查版本） ── */
     char python[MAX_PATH_LEN] = {0};
     if (find_python(python, sizeof(python)) != 0) {
         msgbox_error("Pycapsule",
@@ -842,7 +828,38 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ── 5. 环境检查（仅首次运行） ── */
+    /* ── 5. 首次运行标记（per-app，防止不同 app 共用 stamp） ── */
+    char stamp_path[MAX_PATH_LEN];
+    {
+        const char *td = getenv("TEMP");
+        if (!td) td = getenv("TMP");
+#ifdef _WIN32
+        if (!td) td = "C:\\Windows\\Temp";
+#else
+        if (!td) td = "/tmp";
+#endif
+        /* Sanitize app_name: replace non-alphanumeric with _ */
+        char safe_name[128];
+        {
+            const char *s = g_app_name;
+            char *d = safe_name;
+            size_t n = 0;
+            while (*s && n < sizeof(safe_name) - 1) {
+                if ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+                    (*s >= '0' && *s <= '9')) {
+                    *d++ = *s;
+                } else {
+                    *d++ = '_';
+                }
+                s++; n++;
+            }
+            *d = '\0';
+        }
+        snprintf(stamp_path, sizeof(stamp_path), "%s/_pc_%s_ok", td, safe_name);
+    }
+    int is_first_run = (access(stamp_path, F_OK) != 0);
+
+    /* ── 6. 环境检查（仅首次运行） ── */
     if (is_first_run) {
 #ifndef _WIN32
         /* macOS/Linux: check tkinter */
@@ -910,7 +927,7 @@ int main(int argc, char **argv) {
         if (sf) { fprintf(sf, "ok\n"); fclose(sf); }
     }
 
-    /* ── 6. 启动应用 ── */
+    /* ── 7. 启动应用 ── */
     char bootstrap_path[MAX_PATH_LEN];
     snprintf(bootstrap_path, sizeof(bootstrap_path),
              "%s" PATH_SEP_STR "_pycapsule_" PATH_SEP_STR "bootstrap.py",
