@@ -1,5 +1,5 @@
 """
-pybox 示例 — bootstrap.py 模板
+pycapsule 示例 — bootstrap.py 模板
 
 复制到你的项目根目录，修改启动入口即可。
 C launcher 完成所有环境检测后调用此脚本。

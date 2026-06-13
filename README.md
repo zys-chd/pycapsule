@@ -1,10 +1,10 @@
-# pybox
+# pycapsule
 
 > Pack Python projects into tiny self-contained binaries — 100× smaller than PyInstaller.  
 > Zero console windows. Auto-installs missing dependencies.
 
 ```
-PyInstaller:  74 MB  ──→  pybox:  < 1 MB   (100× smaller)
+PyInstaller:  74 MB  ──→  pycapsule:  < 1 MB   (100× smaller)
 ```
 
 English | [中文](README_zh.md)
@@ -36,16 +36,16 @@ macOS uses `osascript`, Windows uses `MessageBox`, Linux uses `zenity`.
 
 ## Quick Start
 
-### 1. Add pybox to your project
+### 1. Add pycapsule to your project
 
 ```bash
 cd your-project
-git clone https://github.com/yourname/pybox.git
+git clone https://github.com/yourname/pycapsule.git
 ```
 
 ### 2. Edit config
 
-`pybox/src/config.h` — change 5 things:
+`pycapsule/src/config.h` — change 5 things:
 
 ```c
 #define PROJECT_NAME        "My Tool"       // dialog title
@@ -60,7 +60,7 @@ git clone https://github.com/yourname/pybox.git
 
 ### 3. Create bootstrap.py
 
-In your project root, copy and edit `pybox/example/bootstrap.py`:
+In your project root, copy and edit `pycapsule/example/bootstrap.py`:
 
 ```python
 import os, sys
@@ -74,8 +74,8 @@ run()
 ### 4. Build
 
 ```bash
-python pybox/pack.py
-# → pybox/my_tool (macOS/Linux) or pybox/my_tool.exe (Windows)
+python pycapsule/pack.py
+# → pycapsule/my_tool (macOS/Linux) or pycapsule/my_tool.exe (Windows)
 ```
 
 ---
@@ -89,14 +89,14 @@ python pybox/pack.py
 | Windows (MinGW) | [winlibs.com](https://winlibs.com/) → extract → add to PATH | then `pacman -S mingw-w64-x86_64-zlib` |
 | Windows (MSVC) | Visual Studio Build Tools | manual: `cl /O2 /DRESOURCE_H ...` |
 
-**Don't want zlib?** Drop [miniz.h](https://github.com/richgel999/miniz) into `pybox/src/`,  
+**Don't want zlib?** Drop [miniz.h](https://github.com/richgel999/miniz) into `pycapsule/src/`,  
 change `#include <zlib.h>` → `#include "miniz.h"` in `launcher.c`, and compile without `-lz`.
 
 ---
 
 ## Custom Excludes
 
-Create `pybox-exclude.txt` in your project root:
+Create `pycapsule-exclude.txt` in your project root:
 
 ```
 # directories (trailing /)
@@ -114,13 +114,13 @@ large_dataset.csv
 
 ```
 your-project/
-├── pybox/                 ← git clone of pybox
+├── pycapsule/                 ← git clone of pycapsule
 │   ├── pack.py            ← build script
 │   └── src/
 │       ├── config.h       ← ✏️ your config
 │       └── launcher.c     ← C source (don't touch)
 ├── bootstrap.py           ← ✏️ your entry point
-├── pybox-exclude.txt      ← (optional)
+├── pycapsule-exclude.txt      ← (optional)
 └── your_package/          ← your Python code
 ```
 

@@ -2,11 +2,11 @@
  * launcher.c — 通用 Python 项目 C 启动器
  *
  * 将 Python 项目 ZIP 嵌入二进制，运行时：
- *   1. 检测系统 Python 环境
- *   2. 逐项检查依赖（tkinter + pip 包）
- *   3. 缺失则自动安装
- *   4. 启动 Python 主程序
- *   5. 退出时清理临时目录
+ *   0. 检查标记文件 → 已通过则直接启动
+ *   1. 查找系统 Python 并验证版本
+ *   2. 解压项目到临时目录
+ *   3. 首次运行: 逐项检查 pip 依赖 + 静默安装 + 写标记文件
+ *   4. 启动 Python 主程序（pythonw.exe, 无控制台）
  *
  * 移植到新项目：只需修改 config.h
  * 编译：python pack.py
@@ -20,14 +20,74 @@
 #ifdef _WIN32
   #include <windows.h>
   #include <io.h>
-  #define popen   _popen
-  #define pclose  _pclose
   #define unlink  _unlink
   #define rmdir   _rmdir
   #define access  _access
   #define F_OK     0
   #define PATH_SEP '\\'
-  #define PATH_SEP_STR "\\"
+  #define PATH_SEP_STR "\\\\"
+
+  /* ── 静默 popen/system（无黑框） ── */
+  typedef struct { HANDLE hProcess, hThread, hRead; } _spipe_t;
+  static _spipe_t _spipes[16]; static int _spipe_n = 0;
+
+  static FILE *spopen(const char *cmd) {
+      if (_spipe_n >= 16) return NULL;
+      HANDLE hRead, hWrite;
+      SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+      if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return NULL;
+      SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+      STARTUPINFOA si = {sizeof(si)};
+      si.dwFlags = STARTF_USESTDHANDLES;
+      si.hStdOutput = hWrite; si.hStdError = hWrite; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+      PROCESS_INFORMATION pi = {0};
+      char *cmdline = strdup(cmd);
+      BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                               CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+      free(cmdline); CloseHandle(hWrite);
+      if (!ok) { CloseHandle(hRead); return NULL; }
+      CloseHandle(pi.hThread);
+      _spipes[_spipe_n].hProcess = pi.hProcess;
+      _spipes[_spipe_n].hRead = hRead;
+      _spipe_n++;
+      return _fdopen(_open_osfhandle((intptr_t)hRead, 0), "r");
+  }
+
+  static int spclose(FILE *f) {
+      /* Find the matching pipe entry */
+      for (int i = 0; i < _spipe_n; i++) {
+          if (_spipes[i].hRead != INVALID_HANDLE_VALUE) {
+              fclose(f);
+              WaitForSingleObject(_spipes[i].hProcess, INFINITE);
+              DWORD ec; GetExitCodeProcess(_spipes[i].hProcess, &ec);
+              CloseHandle(_spipes[i].hProcess);
+              _spipes[i].hRead = INVALID_HANDLE_VALUE;
+              return (int)ec;
+          }
+      }
+      fclose(f); return -1;
+  }
+
+  static int ssys(const char *cmd) {
+      STARTUPINFOA si = {sizeof(si)};
+      PROCESS_INFORMATION pi = {0};
+      char *cmdline = strdup(cmd);
+      BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                               CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+      free(cmdline);
+      if (!ok) return -1;
+      CloseHandle(pi.hThread);
+      WaitForSingleObject(pi.hProcess, INFINITE);
+      DWORD ec; GetExitCodeProcess(pi.hProcess, &ec);
+      CloseHandle(pi.hProcess);
+      return (int)ec;
+  }
+
+  #undef popen
+  #undef pclose
+  #define popen(c,m)  spopen(c)
+  #define pclose(f)   spclose(f)
+  #define system(c)   ssys(c)
 #else
   #include <unistd.h>
   #include <signal.h>
@@ -41,6 +101,110 @@
 
 #include <zlib.h>
 #include "config.h"
+
+#ifdef _WIN32
+/* ── 状态提示窗口（Unicode, 美观设计） ── */
+static HWND _stat_wnd = NULL;
+static HFONT _stat_font = NULL, _stat_font_title = NULL;
+static HBRUSH _stat_bg = NULL;
+
+/* UTF-8 → WCHAR 辅助 */
+static WCHAR *utf8_to_w(const char *s) {
+    if (!s) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    WCHAR *w = (WCHAR *)malloc(n * sizeof(WCHAR));
+    if (w) MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+    return w;
+}
+
+static void show_status(const char *text) {
+    WCHAR *wtext = utf8_to_w(text);
+    if (_stat_wnd) {
+        if (wtext) { SetWindowTextW(GetDlgItem(_stat_wnd, 101), wtext); free(wtext); }
+        UpdateWindow(_stat_wnd);
+        return;
+    }
+    /* 创建背景画刷 (#F5F6FA) */
+    _stat_bg = CreateSolidBrush(RGB(0xF5, 0xF6, 0xFA));
+
+    WCHAR *wtitle = utf8_to_w(PROJECT_NAME);
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = _stat_bg;
+    wc.lpszClassName = L"MFStatusWnd";
+    RegisterClassW(&wc);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    int ww = 440, wh = 170;
+    _stat_wnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"MFStatusWnd",
+        wtitle ? wtitle : L"", WS_POPUP | WS_BORDER,
+        (sw - ww)/2, (sh - wh)/2, ww, wh, NULL, NULL, wc.hInstance, NULL);
+    free(wtitle);
+
+    _stat_font_title = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+
+    /* 主状态字体 20pt */
+    _stat_font = CreateFontW(24, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+
+    /* 图标 — 🚀 */
+    CreateWindowExW(0, L"STATIC", L"\U0001F680", WS_CHILD | WS_VISIBLE | SS_CENTER,
+        20, 30, 50, 50, _stat_wnd, (HMENU)99, wc.hInstance, NULL);
+    SendMessageW(GetDlgItem(_stat_wnd, 99), WM_SETFONT, (WPARAM)_stat_font, TRUE);
+
+    /* 主状态文字 (ID 101) */
+    CreateWindowExW(0, L"STATIC", wtext ? wtext : L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+        75, 36, ww - 95, 50, _stat_wnd, (HMENU)101, wc.hInstance, NULL);
+    SendMessageW(GetDlgItem(_stat_wnd, 101), WM_SETFONT, (WPARAM)_stat_font, TRUE);
+    free(wtext);
+
+    /* 子状态字体 14pt, 灰色 (ID 102, 初始隐藏) */
+    HFONT sub_font = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+    CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+        75, 80, ww - 95, 40, _stat_wnd, (HMENU)102, wc.hInstance, NULL);
+    SendMessageW(GetDlgItem(_stat_wnd, 102), WM_SETFONT, (WPARAM)sub_font, TRUE);
+    /* Note: sub_font 不释放, 跟随窗口生命周期 */
+
+    /* 底部细线 */
+    CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        0, wh - 2, ww, 2, _stat_wnd, NULL, wc.hInstance, NULL);
+
+    ShowWindow(_stat_wnd, SW_SHOW);
+    UpdateWindow(_stat_wnd);
+}
+
+/* 更新子状态文字（下载进度等） */
+static void show_sub_status(const char *text) {
+    if (!_stat_wnd) return;
+    WCHAR *w = utf8_to_w(text);
+    if (w) { SetWindowTextW(GetDlgItem(_stat_wnd, 102), w); free(w); }
+    UpdateWindow(_stat_wnd);
+}
+
+static void hide_status(void) {
+    if (_stat_wnd) {
+        DestroyWindow(_stat_wnd); _stat_wnd = NULL;
+        if (_stat_font) { DeleteObject(_stat_font); _stat_font = NULL; }
+        if (_stat_font_title) { DeleteObject(_stat_font_title); _stat_font_title = NULL; }
+        if (_stat_bg) { DeleteObject(_stat_bg); _stat_bg = NULL; }
+    }
+}
+
+static void pump_messages(void) {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+}
+#endif
 
 /* ── 辅助宏 ─────────────────────────────────────────── */
 #define _STR(x) #x
@@ -64,15 +228,32 @@ static char g_temp_dir[1024] = {0};
 #define MAX_PATH_LEN    1024
 
 /* ── 跨平台原生对话框 ─────────────────────────────── */
-static void msgbox(const char *title, const char *msg) {
 #ifdef _WIN32
-    MessageBoxA(NULL, msg, title, MB_OK | MB_ICONINFORMATION);
-#elif defined(__APPLE__)
-    char cmd[4096];
-    /* 转义双引号和反斜杠 */
-    char escaped[2048];
-    const char *s = msg;
-    char *d = escaped;
+/* UTF-8 → MessageBoxW（解决中文乱码，MessageBoxA 在 GBK 系统上无法正确显示 UTF-8） */
+static void win_msgbox(const char *title, const char *msg, UINT type) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, msg, -1, NULL, 0);
+    int tlen = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
+    if (wlen <= 0) wlen = 1;
+    if (tlen <= 0) tlen = 1;
+    WCHAR *wmsg = (WCHAR *)malloc(wlen * sizeof(WCHAR));
+    WCHAR *wtit = (WCHAR *)malloc(tlen * sizeof(WCHAR));
+    if (wmsg && wtit) {
+        MultiByteToWideChar(CP_UTF8, 0, msg, -1, wmsg, wlen);
+        MultiByteToWideChar(CP_UTF8, 0, title, -1, wtit, tlen);
+        MessageBoxW(NULL, wmsg, wtit, MB_OK | type);
+    }
+    free(wmsg);
+    free(wtit);
+}
+#define msgbox(t,m)       win_msgbox(t, m, MB_ICONINFORMATION)
+#define msgbox_error(t,m) win_msgbox(t, m, MB_ICONERROR)
+
+#else /* ── macOS / Linux ── */
+
+static void msgbox(const char *title, const char *msg) {
+#if defined(__APPLE__)
+    char cmd[4096], escaped[2048];
+    const char *s = msg; char *d = escaped;
     while (*s && (size_t)(d - escaped) < sizeof(escaped) - 2) {
         if (*s == '\\') { *d++ = '\\'; *d++ = '\\'; }
         else if (*s == '"') { *d++ = '\\'; *d++ = '"'; }
@@ -86,28 +267,20 @@ static void msgbox(const char *title, const char *msg) {
              escaped, title);
     system(cmd);
 #else
-    /* Linux: 尝试 zenity / kdialog / xmessage */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
              "zenity --info --title=\"%s\" --text=\"%s\" 2>/dev/null || "
              "kdialog --title \"%s\" --msgbox \"%s\" 2>/dev/null || "
              "xmessage -center \"%s\" 2>/dev/null",
              title, msg, title, msg, msg);
-    if (system(cmd) != 0) {
-        /* 最后的 fallback */
-        fprintf(stderr, "[%s] %s\n", title, msg);
-    }
+    if (system(cmd) != 0) fprintf(stderr, "[%s] %s\n", title, msg);
 #endif
 }
 
 static void msgbox_error(const char *title, const char *msg) {
-#ifdef _WIN32
-    MessageBoxA(NULL, msg, title, MB_OK | MB_ICONERROR);
-#elif defined(__APPLE__)
-    char cmd[4096];
-    char escaped[2048];
-    const char *s = msg;
-    char *d = escaped;
+#if defined(__APPLE__)
+    char cmd[4096], escaped[2048];
+    const char *s = msg; char *d = escaped;
     while (*s && (size_t)(d - escaped) < sizeof(escaped) - 2) {
         if (*s == '\\') { *d++ = '\\'; *d++ = '\\'; }
         else if (*s == '"') { *d++ = '\\'; *d++ = '"'; }
@@ -126,11 +299,11 @@ static void msgbox_error(const char *title, const char *msg) {
              "zenity --error --title=\"%s\" --text=\"%s\" 2>/dev/null || "
              "xmessage -center \"%s\" 2>/dev/null",
              title, msg, msg);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[ERROR] %s: %s\n", title, msg);
-    }
+    if (system(cmd) != 0) fprintf(stderr, "[ERROR] %s: %s\n", title, msg);
 #endif
 }
+
+#endif /* _WIN32 */
 
 /* ── 小端序读取 ────────────────────────────────────── */
 static inline uint16_t read16(const unsigned char *p) {
@@ -267,16 +440,62 @@ static int extract_zip(const unsigned char *data, size_t size, const char *dest)
     return extracted > 0 ? 0 : -1;
 }
 
-/* ── 查找 Python ───────────────────────────────────── */
+/* ── 查找 Python（含版本验证） ──────────────────────── */
 static int find_python(char *buf, size_t sz) {
+#ifdef _WIN32
+    char cand[512];
+    int have_cand = 0;
+
+    /* 1. py 启动器 */
+    { FILE *fp = popen("py -3 -c \"import sys; print(sys.executable, end='')\"", "r");
+      if (fp) { if (fgets(cand, sizeof(cand), fp)) {
+          size_t l = strlen(cand); while (l>0 && (cand[l-1]=='\n'||cand[l-1]=='\r')) cand[--l]=0;
+          if (l>0 && access(cand, F_OK)==0) have_cand=1;
+      } pclose(fp); } }
+
+    /* 2. where python (cmd 内置命令，必须通过 cmd.exe /c) */
+    if (!have_cand) { FILE *fp = popen("cmd.exe /c \"where python\"", "r");
+      if (fp) { if (fgets(cand, sizeof(cand), fp)) {
+          size_t l = strlen(cand); while (l>0 && (cand[l-1]=='\n'||cand[l-1]=='\r')) cand[--l]=0;
+          if (l>0 && access(cand, F_OK)==0) have_cand=1;
+      } pclose(fp); } }
+
+    /* 3. 常见路径 */
+    if (!have_cand) { const char *p[] = {
+        "C:\\Python312\\python.exe","C:\\Python311\\python.exe","C:\\Python310\\python.exe",
+        "C:\\Program Files\\Python312\\python.exe","C:\\Program Files\\Python311\\python.exe",
+        "C:\\Program Files\\Python310\\python.exe", NULL};
+      for (int i=0; p[i]; i++) if (access(p[i],F_OK)==0) {
+          strncpy(cand,p[i],sizeof(cand)); cand[sizeof(cand)-1]=0; have_cand=1; break;
+      } }
+
+    if (!have_cand) return -1;
+
+    /* 验证版本: python --version → 解析 "Python 3.x.y" */
+    { char cmd[640]; snprintf(cmd, sizeof(cmd), "\"%s\" --version", cand);
+      FILE *fp = popen(cmd, "r");
+      if (fp) {
+          char ver[64]={0}; fread(ver,1,sizeof(ver)-1,fp); pclose(fp);
+          int major=0, minor=0;
+          if (sscanf(ver, "Python %d.%d", &major, &minor) >= 2) {
+              if (major > MIN_PYTHON_MAJOR || (major == MIN_PYTHON_MAJOR && minor >= MIN_PYTHON_MINOR)) {
+                  strncpy(buf, cand, sz); buf[sz-1]=0; return 0;
+              }
+          }
+          /* 失败: 附上版本号到错误消息 */
+          snprintf(buf, sz, "VERFAIL:%s|ver=%d.%d", cand, major, minor);
+          return -1;
+      }
+    }
+    snprintf(buf, sz, "VERFAIL:%s|cmd=err", cand);
+    return -1;
+
+#else
+    /* macOS / Linux */
     const char *cands[] = {"python3", "python", NULL};
     for (int i = 0; cands[i]; i++) {
         char cmd[512];
-#ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "where %s 2>nul", cands[i]);
-#else
         snprintf(cmd, sizeof(cmd), "command -v %s 2>/dev/null", cands[i]);
-#endif
         FILE *fp = popen(cmd, "r");
         if (!fp) continue;
         if (fgets(buf, (int)sz, fp)) {
@@ -288,9 +507,8 @@ static int find_python(char *buf, size_t sz) {
         pclose(fp);
     }
     return -1;
+#endif
 }
-
-/* ── 临时目录 ──────────────────────────────────────── */
 static int create_temp_dir(char *buf, size_t sz) {
     const char *tmp = getenv("TMPDIR");
     if (!tmp) tmp = getenv("TEMP");
@@ -363,56 +581,34 @@ static void sig_handler(int s) { (void)s; do_cleanup(); _exit(1); }
 #endif
 
 /* ═══════════════════════════════════════════════════════
- * 依赖检查（全部在 C 层完成，不依赖 bootstrap.py）
+ * 依赖检查
  * ═══════════════════════════════════════════════════════ */
 
-/* 运行 python 命令，返回 exit code */
-static int run_py_cmd(const char *python, const char *py_code, char *out, size_t out_sz) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "\"%s\" -c \"%s\" 2>&1", python, py_code);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    if (out && out_sz > 0) {
-        size_t n = fread(out, 1, out_sz - 1, fp);
-        if (n > 0) out[n] = '\0';
-        else out[0] = '\0';
-    }
-    int ret = pclose(fp);
-#ifdef _WIN32
-    return ret;
-#else
-    return WIFEXITED(ret) ? WEXITSTATUS(ret) : -1;
-#endif
-}
-
-/* 检查 pip 包是否已安装 */
+/* 检查 pip 包是否已安装（直接用 system 退出码，ssys=GetExitCodeProcess 可靠） */
 static int check_package(const char *python, const char *import_name) {
-    char code[512], out[256] = {0};
-    snprintf(code, sizeof(code), "import %s", import_name);
-    return run_py_cmd(python, code, out, sizeof(out));
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "\"%s\" -c \"import %s\"", python, import_name);
+    return system(cmd);
 }
 
 /* pip install 包列表 */
 static int pip_install(const char *python, const char *packages) {
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" -m pip install --quiet --disable-pip-version-check %s 2>&1",
+             "\"%s\" -m pip install --quiet --disable-pip-version-check %s",
              python, packages);
-    int ret = system(cmd);
-#ifdef _WIN32
-    return ret;
-#else
-    return WIFEXITED(ret) ? WEXITSTATUS(ret) : -1;
-#endif
+    return system(cmd);
 }
 
-/* 检查 Python 版本 */
-static int check_python_version(const char *python) {
-    char code[256];
-    snprintf(code, sizeof(code),
-             "import sys; sys.exit(0 if sys.version_info >= (%d,%d) else 1)",
-             MIN_PYTHON_MAJOR, MIN_PYTHON_MINOR);
-    return run_py_cmd(python, code, NULL, 0);
+/* 逐包安装（带包名进度，不解析下载细节避免文本处理坑） */
+static void pip_install_one(const char *python, const char *pkg, int cur, int total) {
+    char cmd[4096], prog[128];
+    snprintf(prog, sizeof(prog), "正在安装 %s (%d/%d)...", pkg, cur, total);
+    show_status(prog); pump_messages();
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" -m pip install --quiet --disable-pip-version-check %s",
+             python, pkg);
+    system(cmd);
 }
 
 /* 检查 tkinter */
@@ -426,6 +622,19 @@ static int check_tkinter(const char *python) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
+    /* ── 隐藏模式: --cleanup <tempdir> <pid> ── */
+    if (argc >= 4 && strcmp(argv[1], "--cleanup") == 0) {
+        DWORD pid = (DWORD)atoi(argv[3]);
+        HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (h) {
+            WaitForSingleObject(h, INFINITE);
+            CloseHandle(h);
+        }
+        Sleep(500);  /* 等文件系统释放 */
+        remove_dir(argv[2]);
+        return 0;
+    }
+
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 #else
     signal(SIGINT, sig_handler);
@@ -433,28 +642,48 @@ int main(int argc, char **argv) {
 #endif
     atexit(do_cleanup);
 
-    /* ── 1. 查找 Python ── */
+    /* ── 0. 快速路径：已通过首次检查则直接启动 ── */
+    char stamp_path[MAX_PATH_LEN];
+    {
+        const char *td = getenv("TEMP");
+        if (!td) td = getenv("TMP");
+#ifdef _WIN32
+        if (!td) td = "C:\\Windows\\Temp";
+#else
+        if (!td) td = "/tmp";
+#endif
+        snprintf(stamp_path, sizeof(stamp_path), "%s/_mf_env_ok", td);
+    }
+    int is_first_run = (access(stamp_path, F_OK) != 0);
+
+    /* ── 1. 查找 Python（含版本验证） ── */
     char python[MAX_PATH_LEN] = {0};
     if (find_python(python, sizeof(python)) != 0) {
-        msgbox_error(PROJECT_NAME,
-            "未找到 Python。\n\n"
-            "请安装 Python " STR(MIN_PYTHON_MAJOR) "." STR(MIN_PYTHON_MINOR) " 或更高版本：\n"
-            PROJECT_URL);
-        return 1;
-    }
-
-    /* ── 2. 检查 Python 版本 ── */
-    if (check_python_version(python) != 0) {
-        char msg[1024];
-        snprintf(msg, sizeof(msg),
-            "Python 版本过低。\n\n"
-            "需要 Python >= " STR(MIN_PYTHON_MAJOR) "." STR(MIN_PYTHON_MINOR) "。\n"
-            "请升级后重试：\n" PROJECT_URL);
+        char msg[1280];
+        if (strncmp(python, "VERFAIL:", 8) == 0) {
+            char *path = python + 8;
+            char *ver = strstr(path, "|ver=");
+            char found_ver[32] = "?";
+            if (ver) { *ver = '\0'; snprintf(found_ver, sizeof(found_ver), "%s", ver + 5); }
+            snprintf(msg, sizeof(msg),
+                "Python 版本过低。\n\n"
+                "找到: %s  (版本 %s)\n"
+                "需要 >= " STR(MIN_PYTHON_MAJOR) "." STR(MIN_PYTHON_MINOR) "\n\n"
+                "请安装后重试：\n" PROJECT_URL,
+                path, found_ver);
+        } else {
+            snprintf(msg, sizeof(msg),
+                "未找到 Python " STR(MIN_PYTHON_MAJOR) "." STR(MIN_PYTHON_MINOR) " 或更高版本。\n\n"
+                "请安装后重试：\n" PROJECT_URL);
+        }
         msgbox_error(PROJECT_NAME, msg);
         return 1;
     }
 
-    /* ── 3. 创建临时目录、解压资源 ── */
+    /* ── 2. 创建临时目录、解压资源 ── */
+#ifdef _WIN32
+    if (is_first_run) { show_status("正在准备运行环境..."); pump_messages(); }
+#endif
     if (create_temp_dir(g_temp_dir, sizeof(g_temp_dir)) != 0) {
         msgbox_error(PROJECT_NAME, "无法创建临时目录。");
         return 1;
@@ -464,93 +693,108 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ── 4. 检查 tkinter ── */
-    if (check_tkinter(python) != 0) {
-#ifdef _WIN32
-        const char *guide = TKINTER_WIN_MSG;
-#elif defined(__APPLE__)
-        const char *guide = TKINTER_MAC_MSG;
+    /* ── 3-5. 环境检查（仅首次运行） ── */
+    if (is_first_run) {
+#ifndef _WIN32
+        if (check_tkinter(python) != 0) {
+#if defined(__APPLE__)
+            const char *guide = TKINTER_MAC_MSG;
 #else
-        const char *guide = TKINTER_LINUX_MSG;
+            const char *guide = TKINTER_LINUX_MSG;
 #endif
-        char msg[1024];
-        snprintf(msg, sizeof(msg),
-            "缺少 tkinter 组件。\n\n%s", guide);
-        msgbox_error(PROJECT_NAME, msg);
-        return 1;
-    }
-
-    /* ── 5. 检查 pip 依赖 ── */
-    char missing[2048] = {0};
-    int missing_count = 0;
-    for (int i = 0; i < REQUIREMENTS_COUNT; i++) {
-        if (check_package(python, REQUIREMENTS[i].import_name) != 0) {
-            if (missing_count > 0) strcat(missing, " ");
-            strcat(missing, REQUIREMENTS[i].pip_name);
-            missing_count++;
-        }
-    }
-
-    /* ── 6. 安装缺失依赖 ── */
-    if (missing_count > 0) {
-        /* 提示用户 */
-        char msg_text[3072];
-        snprintf(msg_text, sizeof(msg_text),
-            "首次运行，需要安装以下依赖：\n\n"
-            "  %s\n\n"
-            "点击「确定」开始安装（需要网络连接）。",
-            missing);
+            char msg[1024];
+            snprintf(msg, sizeof(msg),
+                "缺少 tkinter 组件。\n\n%s", guide);
 #ifdef _WIN32
-        int answer = MessageBoxA(NULL, msg_text, PROJECT_NAME " — 依赖安装",
-                                 MB_OKCANCEL | MB_ICONINFORMATION);
-        if (answer != IDOK) return 0;
-#else
-        /* macOS/Linux 用 osascript/zenity 询问 */
-        msgbox(PROJECT_NAME " — 依赖安装", msg_text);
+            hide_status();
 #endif
-
-        if (pip_install(python, missing) != 0) {
-            char err[1024];
-            snprintf(err, sizeof(err),
-                "依赖安装失败。\n\n"
-                "请手动运行以下命令后重试：\n"
-                "  pip install %s", missing);
-            msgbox_error(PROJECT_NAME, err);
+            msgbox_error(PROJECT_NAME, msg);
             return 1;
         }
+#endif
 
-        /* 验证安装 */
-        int still_missing = 0;
-        for (int i = 0; i < REQUIREMENTS_COUNT; i++) {
-            if (check_package(python, REQUIREMENTS[i].import_name) != 0)
-                still_missing++;
+        /* 收集缺失的包索引 */
+        int missing_idx[32], missing_count = 0;
+        for (int i = 0; i < REQUIREMENTS_COUNT && missing_count < 32; i++) {
+#ifdef _WIN32
+            { char prog[128]; snprintf(prog, sizeof(prog),
+                "正在检查 %s (%d/%d)...", REQUIREMENTS[i].import_name, i+1, REQUIREMENTS_COUNT);
+              show_status(prog); pump_messages(); }
+#endif
+            if (check_package(python, REQUIREMENTS[i].import_name) != 0) {
+                missing_idx[missing_count++] = i;
+            }
         }
-        if (still_missing > 0) {
-            msgbox_error(PROJECT_NAME,
-                "部分依赖安装后仍不可用。\n请检查网络连接后重试。");
-            return 1;
+
+        if (missing_count > 0) {
+            for (int m = 0; m < missing_count; m++) {
+                int idx = missing_idx[m];
+                pip_install_one(python, REQUIREMENTS[idx].pip_name, m + 1, missing_count);
+            }
+            /* 验证安装 */
+            int still_missing = 0;
+            for (int i = 0; i < REQUIREMENTS_COUNT; i++) {
+                if (check_package(python, REQUIREMENTS[i].import_name) != 0)
+                    still_missing++;
+            }
+            if (still_missing > 0) {
+#ifdef _WIN32
+                hide_status();
+#endif
+                msgbox_error(PROJECT_NAME,
+                    "部分依赖安装后仍不可用。\n请检查网络连接后重试。");
+                return 1;
+            }
         }
+
+        /* 首次检查通过，写标记文件 */
+#ifdef _WIN32
+        hide_status();
+#endif
+        FILE *sf = fopen(stamp_path, "w");
+        if (sf) { fprintf(sf, "ok\n"); fclose(sf); }
     }
 
-    /* ── 7. 启动应用 ── */
-    /* 构建命令行: python3 <tmp>/ZIP_PREFIX/bootstrap.py [args...] */
+    /* ── 6. 启动应用 ── */
     char bootstrap_path[MAX_PATH_LEN];
     snprintf(bootstrap_path, sizeof(bootstrap_path),
              "%s" PATH_SEP_STR ZIP_PREFIX PATH_SEP_STR "bootstrap.py",
              g_temp_dir);
 
+#ifdef _WIN32
+    /* 用 pythonw.exe 替代 python.exe — 无控制台黑框 */
+    char pyw[MAX_PATH_LEN];
+    strncpy(pyw, python, sizeof(pyw)); pyw[sizeof(pyw)-1] = '\0';
+    char *dot = strstr(pyw, "python.exe");
+    if (dot) memcpy(dot + 6, "w.exe", 5);
+
     char cmd[8192];
-    int pos = snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\"", python, bootstrap_path);
+    int pos = snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\"", pyw, bootstrap_path);
     for (int i = 1; i < argc && (size_t)pos < sizeof(cmd) - 1; i++) {
         pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " \"%s\"", argv[i]);
     }
 
-#ifdef _WIN32
     STARTUPINFOA si = {0}; PROCESS_INFORMATION pi = {0}; si.cb = sizeof(si);
-    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, g_temp_dir, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                   NULL, g_temp_dir, &si, &pi);
+
+    /* 起清理子进程: 等待 Python 退出后删除临时目录 */
+    {
+        char my_path[MAX_PATH_LEN];
+        GetModuleFileNameA(NULL, my_path, sizeof(my_path));
+        char cln_cmd[MAX_PATH_LEN + 256];
+        snprintf(cln_cmd, sizeof(cln_cmd), "\"%s\" --cleanup \"%s\" %lu",
+                 my_path, g_temp_dir, pi.dwProcessId);
+        STARTUPINFOA csi = {0}; PROCESS_INFORMATION cpi = {0}; csi.cb = sizeof(csi);
+        CreateProcessA(NULL, cln_cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &csi, &cpi);
+        if (cpi.hProcess) CloseHandle(cpi.hProcess);
+        if (cpi.hThread) CloseHandle(cpi.hThread);
     }
+
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (pi.hThread) CloseHandle(pi.hThread);
+    _exit(0);
 #else
     int ret = system(cmd);
     (void)ret;

@@ -1,9 +1,9 @@
 /*
- * config.h — pybox 项目配置模板
+ * config.h — pycapsule 项目配置模板
  * ─────────────────────────────────────────────────
  * 复制此文件并修改以下字段即可适配你的项目。
  *
- * 打包: python pybox/pack.py
+ * 打包: python pycapsule/pack.py
  */
 
 #ifndef CONFIG_H
