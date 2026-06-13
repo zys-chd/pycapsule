@@ -725,20 +725,34 @@ static int load_config(const char *tmpdir) {
  * 依赖检查（全部在 C 层完成）
  * ═══════════════════════════════════════════════════════ */
 
+/* 返回值: 0=已安装, 1=未安装, -1=Python 执行失败 */
 static int check_package(const char *python, const char *import_name) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "\"%s\" -c \"import %s\"", python, import_name);
-    return system(cmd);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;  /* popen failed — Python unreachable */
+    char out[256] = {0};
+    fread(out, 1, sizeof(out)-1, fp);
+    int ret = pclose(fp);
+    /* ret == -1 means process couldn't start; ret != 0 means import failed */
+    return (ret == -1) ? -1 : (ret != 0 ? 1 : 0);
 }
 
-static void pip_install_one(const char *python, const char *pkg, int cur, int total) {
+/* pip install one package, capturing output for diagnostics */
+static int pip_install_one(const char *python, const char *pkg, int cur, int total) {
     char cmd[4096], prog[128];
-    snprintf(prog, sizeof(prog), "正在安装 %s (%d/%d)...", pkg, cur, total);
+    snprintf(prog, sizeof(prog), "Installing %s (%d/%d)...", pkg, cur, total);
     show_status(prog); pump_messages();
     snprintf(cmd, sizeof(cmd),
              "\"%s\" -m pip install --quiet --disable-pip-version-check %s",
              python, pkg);
-    system(cmd);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    /* Read and discard output (--quiet suppresses most, but errors go to stderr) */
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp)) { /* drain */ }
+    int ret = pclose(fp);
+    return (ret == -1) ? -1 : ret;
 }
 
 static int check_tkinter(const char *python) {
@@ -893,28 +907,81 @@ int main(int argc, char **argv) {
                   "正在检查 %s (%d/%d)...", g_req_import[i], i+1, g_req_count);
               show_status(prog); pump_messages(); }
 #endif
-            if (check_package(python, g_req_import[i]) != 0) {
+            int cr = check_package(python, g_req_import[i]);
+            if (cr == -1) {
+                /* Python not reachable — fatal */
+#ifdef _WIN32
+                hide_status();
+#endif
+                char msg[768];
+                snprintf(msg, sizeof(msg),
+                    "无法运行 Python。\n\n"
+                    "Python 路径: %s\n\n"
+                    "请确认 Python 安装正确，或重新安装：\n%s",
+                    python, g_python_url);
+                msgbox_error(g_app_name, msg);
+                return 1;
+            }
+            if (cr != 0) {
                 missing_idx[missing_count++] = i;
             }
         }
 
         if (missing_count > 0) {
+            /* Build list of missing package names for error display */
+            char missing_names[1024] = {0};
+            int name_pos = 0;
             for (int m = 0; m < missing_count; m++) {
                 int idx = missing_idx[m];
-                pip_install_one(python, g_req_pip[idx], m + 1, missing_count);
+                int n = snprintf(missing_names + name_pos,
+                    sizeof(missing_names) - name_pos,
+                    "%s%s", (m > 0 ? ", " : ""), g_req_import[idx]);
+                if (n > 0) name_pos += n;
+            }
+
+            for (int m = 0; m < missing_count; m++) {
+                int idx = missing_idx[m];
+                int pr = pip_install_one(python, g_req_pip[idx], m + 1, missing_count);
+                if (pr == -1) {
+#ifdef _WIN32
+                    hide_status();
+#endif
+                    char msg[1024];
+                    snprintf(msg, sizeof(msg),
+                        "无法运行 pip。\n\n"
+                        "Python 路径: %s\n"
+                        "请确认 pip 可用，或手动安装：\n"
+                        "  pip install %s",
+                        python, g_req_pip[idx]);
+                    msgbox_error(g_app_name, msg);
+                    return 1;
+                }
             }
             /* 验证安装 */
             int still_missing = 0;
+            char still_names[1024] = {0};
+            int sn_pos = 0;
             for (int i = 0; i < g_req_count; i++) {
-                if (check_package(python, g_req_import[i]) != 0)
+                if (check_package(python, g_req_import[i]) != 0) {
                     still_missing++;
+                    int n = snprintf(still_names + sn_pos,
+                        sizeof(still_names) - sn_pos,
+                        "%s%s", (still_missing > 1 ? ", " : ""), g_req_import[i]);
+                    if (n > 0) sn_pos += n;
+                }
             }
             if (still_missing > 0) {
 #ifdef _WIN32
                 hide_status();
 #endif
-                msgbox_error(g_app_name,
-                    "部分依赖安装后仍不可用。\n请检查网络连接后重试。");
+                char msg[1536];
+                snprintf(msg, sizeof(msg),
+                    "以下依赖安装失败：\n\n"
+                    "  %s\n\n"
+                    "请检查网络连接后重试，或手动安装：\n"
+                    "  pip install %s",
+                    still_names, still_names);
+                msgbox_error(g_app_name, msg);
                 return 1;
             }
         }
